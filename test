@@ -2,10 +2,406 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>test</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Kungfu Duel (HTML Canvas)</title>
+  <style>
+    html, body { margin:0; height:100%; background:#111; color:#ddd; font-family: system-ui, -apple-system, sans-serif; }
+    .wrap { display:flex; flex-direction:column; height:100%; }
+    #hud { display:flex; gap:12px; padding:10px 12px; align-items:center; }
+    .bar { flex:1; height:14px; background:#333; border-radius:999px; overflow:hidden; }
+    .fill { height:100%; width:100%; background:#6dd; }
+    .fill.p2 { background:#d6d; }
+    #hint { font-size:12px; opacity:.85; white-space:nowrap; }
+    canvas { width:100%; height:100%; display:block; background:linear-gradient(#222,#111); }
+
+    /* Mobile controls */
+    #controls {
+      position:fixed; left:0; right:0; bottom:0;
+      display:flex; justify-content:space-between; gap:10px;
+      padding:10px; pointer-events:none;
+    }
+    .pad { display:flex; gap:8px; pointer-events:auto; }
+    .btn {
+      width:56px; height:56px; border-radius:14px;
+      background:#1f1f1f; border:1px solid #444; color:#ddd;
+      display:flex; align-items:center; justify-content:center;
+      user-select:none; -webkit-user-select:none;
+      touch-action:none;
+      font-size:12px;
+    }
+    .btn:active { transform:scale(0.98); }
+    @media (min-width: 900px) {
+      #controls { display:none; }
+    }
+  </style>
 </head>
 <body>
-  <h1>テスト公開できました</h1>
+<div class="wrap">
+  <div id="hud">
+    <div class="bar"><div id="hp1" class="fill"></div></div>
+    <div id="hint">P1: A/D/W + J(振る) K(突く) ｜ P2: ←/→/↑ + 1(振る) 2(突く)</div>
+    <div class="bar"><div id="hp2" class="fill p2"></div></div>
+  </div>
+  <canvas id="c"></canvas>
+</div>
+
+<!-- Mobile buttons -->
+<div id="controls">
+  <div class="pad">
+    <div class="btn" data-k="KeyA">P1←</div>
+    <div class="btn" data-k="KeyD">P1→</div>
+    <div class="btn" data-k="KeyW">P1↑</div>
+    <div class="btn" data-k="KeyJ">振る</div>
+    <div class="btn" data-k="KeyK">突く</div>
+  </div>
+  <div class="pad">
+    <div class="btn" data-k="ArrowLeft">P2←</div>
+    <div class="btn" data-k="ArrowRight">P2→</div>
+    <div class="btn" data-k="ArrowUp">P2↑</div>
+    <div class="btn" data-k="Digit1">振る</div>
+    <div class="btn" data-k="Digit2">突く</div>
+  </div>
+</div>
+
+<script>
+(() => {
+  // ====== 設定 ======
+  const SPRITE_SRC = "fighter.jpeg"; // ← 画像ファイル名（同じフォルダに置く）
+  const WORLD_W = 960;
+  const WORLD_H = 540;
+  const FLOOR_Y = 430;
+
+  const GRAVITY = 2200;
+  const MOVE_SPEED = 320;
+  const JUMP_VY = 820;
+
+  // 攻撃の当たり判定（ヒットボックス）パラメータ
+  // swing: 横に広い／thrust: 細く前方に長い
+  const ATTACKS = {
+    swing:  { windup: 0.08, active: 0.12, recover: 0.18,  w: 140, h: 80,  dx: 70,  dmg: 10, kbX: 520, kbY: 260 },
+    thrust: { windup: 0.05, active: 0.10, recover: 0.22,  w: 160, h: 40,  dx: 90,  dmg: 14, kbX: 680, kbY: 180 },
+  };
+
+  // ====== Canvas準備 ======
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha:false });
+
+  function resize() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width  = Math.floor(canvas.clientWidth  * dpr);
+    canvas.height = Math.floor((window.innerHeight - document.getElementById("hud").offsetHeight) * dpr);
+  }
+  window.addEventListener("resize", resize);
+
+  // 仮想解像度 → 実Canvasにフィットさせる
+  function beginFrame() {
+    resize();
+    const w = canvas.width, h = canvas.height;
+    const scale = Math.min(w / WORLD_W, h / WORLD_H);
+    const ox = (w - WORLD_W * scale) * 0.5;
+    const oy = (h - WORLD_H * scale) * 0.5;
+    ctx.setTransform(scale, 0, 0, scale, ox, oy);
+    ctx.imageSmoothingEnabled = false;
+  }
+
+  // ====== 入力 ======
+  const keys = new Map();
+  window.addEventListener("keydown", (e) => keys.set(e.code, true));
+  window.addEventListener("keyup", (e) => keys.set(e.code, false));
+
+  // Mobile buttons emulate key press
+  const btns = document.querySelectorAll(".btn");
+  for (const b of btns) {
+    const code = b.dataset.k;
+    const down = (e) => { e.preventDefault(); keys.set(code, true); };
+    const up   = (e) => { e.preventDefault(); keys.set(code, false); };
+    b.addEventListener("pointerdown", down);
+    b.addEventListener("pointerup", up);
+    b.addEventListener("pointercancel", up);
+    b.addEventListener("pointerleave", up);
+  }
+
+  // ====== ユーティリティ ======
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const rectsOverlap = (a,b) =>
+    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+  // ====== キャラ定義 ======
+  class Fighter {
+    constructor(x, hueDeg, controls) {
+      this.x = x; this.y = FLOOR_Y;
+      this.vx = 0; this.vy = 0;
+      this.facing = 1; // 1=右, -1=左
+      this.w = 120; this.h = 140; // 当たり判定（体）
+      this.hp = 100;
+
+      this.hueDeg = hueDeg; // 色違い
+      this.controls = controls;
+
+      this.attack = null; // {name,t,hitDone}
+      this.stunT = 0;
+      this.onGround = true;
+    }
+
+    bodyRect() {
+      return { x: this.x - this.w/2, y: this.y - this.h, w: this.w, h: this.h };
+    }
+
+    startAttack(name) {
+      if (this.stunT > 0) return;
+      if (this.attack) return;
+      this.attack = { name, t: 0, hitDone: false };
+    }
+
+    attackHitbox() {
+      if (!this.attack) return null;
+      const a = ATTACKS[this.attack.name];
+      const t = this.attack.t;
+      const wind = a.windup, act = a.active;
+
+      if (t < wind || t > wind + act) return null;
+
+      const dx = a.dx * this.facing;
+      const hb = {
+        x: this.x + dx - a.w/2,
+        y: this.y - this.h + 45,
+        w: a.w,
+        h: a.h
+      };
+      return hb;
+    }
+
+    update(dt) {
+      // stun
+      if (this.stunT > 0) this.stunT = Math.max(0, this.stunT - dt);
+
+      // attack timer
+      if (this.attack) {
+        const a = ATTACKS[this.attack.name];
+        this.attack.t += dt;
+        const endT = a.windup + a.active + a.recover;
+        if (this.attack.t >= endT) this.attack = null;
+      }
+
+      // movement (disabled while attacking a bit, but not completely)
+      let move = 0;
+      if (this.stunT <= 0) {
+        if (keys.get(this.controls.left)) move -= 1;
+        if (keys.get(this.controls.right)) move += 1;
+
+        if (move !== 0) this.facing = move > 0 ? 1 : -1;
+
+        // jump
+        const wantJump = keys.get(this.controls.jump);
+        if (wantJump && this.onGround && !this.attack) {
+          this.vy = -JUMP_VY;
+          this.onGround = false;
+        }
+
+        // attacks
+        if (keys.get(this.controls.swing)) this.startAttack("swing");
+        if (keys.get(this.controls.thrust)) this.startAttack("thrust");
+      }
+
+      // apply move
+      const speedMul = this.attack ? 0.65 : 1.0;
+      this.vx = move * MOVE_SPEED * speedMul;
+
+      // physics
+      this.vy += GRAVITY * dt;
+      this.x += this.vx * dt;
+      this.y += this.vy * dt;
+
+      // bounds / floor
+      this.x = clamp(this.x, 80, WORLD_W - 80);
+      if (this.y >= FLOOR_Y) {
+        this.y = FLOOR_Y;
+        this.vy = 0;
+        this.onGround = true;
+      }
+    }
+
+    draw(sprite, flip) {
+      const r = this.bodyRect();
+
+      // shadow
+      ctx.globalAlpha = 0.25;
+      ctx.beginPath();
+      ctx.ellipse(this.x, FLOOR_Y+6, 46, 12, 0, 0, Math.PI*2);
+      ctx.fillStyle = "#000";
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // sprite draw (centered)
+      const imgW = sprite.width, imgH = sprite.height;
+      const scale = 2.4; // サイズ調整：画像の見た目でいじる
+      const drawW = imgW * scale;
+      const drawH = imgH * scale;
+
+      ctx.save();
+      // position
+      ctx.translate(this.x, this.y - this.h + 18);
+
+      // facing
+      ctx.scale(this.facing, 1);
+
+      // hue shift for color variant
+      ctx.filter = this.hueDeg ? `hue-rotate(${this.hueDeg}deg)` : "none";
+
+      // "被弾中"の点滅
+      if (this.stunT > 0) {
+        ctx.globalAlpha = 0.6 + 0.4 * Math.sin(perfNow()*60);
+      }
+
+      // draw image
+      ctx.drawImage(sprite, -drawW/2, -drawH/2, drawW, drawH);
+
+      ctx.restore();
+      ctx.filter = "none";
+
+      // debug rectangles (必要ならtrueに)
+      const DEBUG = false;
+      if (DEBUG) {
+        const b = this.bodyRect();
+        ctx.strokeStyle = "#0f0";
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+        const hb = this.attackHitbox();
+        if (hb) {
+          ctx.strokeStyle = "#f00";
+          ctx.strokeRect(hb.x, hb.y, hb.w, hb.h);
+        }
+      }
+    }
+  }
+
+  const perfNow = () => performance.now() / 1000;
+
+  // ====== ゲーム状態 ======
+  const hp1El = document.getElementById("hp1");
+  const hp2El = document.getElementById("hp2");
+
+  const p1 = new Fighter(260, 0, {
+    left:"KeyA", right:"KeyD", jump:"KeyW", swing:"KeyJ", thrust:"KeyK"
+  });
+  const p2 = new Fighter(700, 160, {
+    left:"ArrowLeft", right:"ArrowRight", jump:"ArrowUp", swing:"Digit1", thrust:"Digit2"
+  });
+
+  function faceEachOther() {
+    // 近距離時は自然に向き合う
+    if (Math.abs(p1.x - p2.x) < 260) {
+      p1.facing = p1.x < p2.x ? 1 : -1;
+      p2.facing = p2.x < p1.x ? 1 : -1;
+    }
+  }
+
+  function resolveAttacks(attacker, defender) {
+    const hb = attacker.attackHitbox();
+    if (!hb || !attacker.attack || attacker.attack.hitDone) return;
+
+    const body = defender.bodyRect();
+    if (!rectsOverlap(hb, body)) return;
+
+    // hit!
+    attacker.attack.hitDone = true;
+
+    const a = ATTACKS[attacker.attack.name];
+    defender.hp = Math.max(0, defender.hp - a.dmg);
+    defender.stunT = 0.28;
+
+    // knockback
+    const dir = attacker.facing;
+    defender.vx += dir * a.kbX * 0.016; // ざっくり
+    defender.vy -= a.kbY * 0.016;
+    defender.onGround = false;
+  }
+
+  function drawStage() {
+    // floor
+    ctx.fillStyle = "#1a1a1a";
+    ctx.fillRect(0, FLOOR_Y, WORLD_W, WORLD_H - FLOOR_Y);
+
+    // simple grid
+    ctx.globalAlpha = 0.12;
+    ctx.strokeStyle = "#fff";
+    for (let x=0; x<=WORLD_W; x+=80) {
+      ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,WORLD_H); ctx.stroke();
+    }
+    for (let y=0; y<=WORLD_H; y+=60) {
+      ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(WORLD_W,y); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawTextCenter(text) {
+    ctx.save();
+    ctx.font = "36px system-ui, -apple-system, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#fff";
+    ctx.fillText(text, WORLD_W/2, WORLD_H/2 - 20);
+    ctx.font = "16px system-ui, -apple-system, sans-serif";
+    ctx.fillStyle = "#ccc";
+    ctx.fillText("Rキーでリスタート", WORLD_W/2, WORLD_H/2 + 20);
+    ctx.restore();
+  }
+
+  function resetGame() {
+    p1.x=260; p1.y=FLOOR_Y; p1.vx=p1.vy=0; p1.hp=100; p1.attack=null; p1.stunT=0;
+    p2.x=700; p2.y=FLOOR_Y; p2.vx=p2.vy=0; p2.hp=100; p2.attack=null; p2.stunT=0;
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "KeyR") resetGame();
+  });
+
+  // ====== メインループ ======
+  const sprite = new Image();
+  sprite.src = SPRITE_SRC;
+  sprite.onload = () => start();
+  sprite.onerror = () => {
+    alert("画像が読み込めませんでした。ファイル名と配置を確認してください: " + SPRITE_SRC);
+  };
+
+  function start() {
+    let last = performance.now();
+    function tick(now) {
+      const dt = Math.min(0.033, (now - last) / 1000);
+      last = now;
+
+      beginFrame();
+      drawStage();
+
+      // update if alive
+      const gameOver = (p1.hp <= 0 || p2.hp <= 0);
+      if (!gameOver) {
+        p1.update(dt);
+        p2.update(dt);
+        faceEachOther();
+
+        // attacks
+        resolveAttacks(p1, p2);
+        resolveAttacks(p2, p1);
+      }
+
+      // draw fighters
+      p1.draw(sprite);
+      p2.draw(sprite);
+
+      // HUD
+      hp1El.style.width = (p1.hp) + "%";
+      hp2El.style.width = (p2.hp) + "%";
+
+      if (gameOver) {
+        const winner = p1.hp > 0 ? "P1 WIN" : "P2 WIN";
+        drawTextCenter(winner);
+      }
+
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  }
+})();
+</script>
 </body>
 </html>
